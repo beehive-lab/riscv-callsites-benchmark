@@ -1,0 +1,153 @@
+#!/usr/bin/perl
+
+use strict;
+
+#
+# nfuncs: controls the number of target methods to be generated
+# ncalls: controls the number of call-sites to be generated
+# patching_percentage: controls the percentage of call sites to be patched 0-50
+#
+die "Usage: $0 <nfuncs> <ncalls> <patching_percentage>" unless @ARGV;
+
+my $functions = $ARGV[0];
+my $calls = $ARGV[1];
+my $patch_percentage = $ARGV[2];
+
+die "patching_percentage may be <= 50 or 100, values in the range (50,100) are not supported" unless $patch_percentage <= 50 || 100;
+
+my $calls_to_patch = ($calls * $patch_percentage) / 100;
+my $patch_every_n_calls = $calls +1;
+
+if ($calls_to_patch > 0) {
+  $patch_every_n_calls = $calls / $calls_to_patch;
+}
+
+print <<EndOfPrologue;
+.global test_setup, test_entry, test_end
+test_setup:
+	ret
+test_entry:
+	addi sp, sp, -16
+	sd   ra, 8(sp)
+	sd   s0, 0(sp) /* s0==fp==x8 */
+	addi s0, sp, 16
+START:
+EndOfPrologue
+
+my $i = 0;
+
+while ($i < $calls) {
+    if (should_patch($i) == 1) {
+        emit_patching_call_site($i);
+    } else {
+        emit_call_site($i);
+    }
+	$i++;
+}
+
+print <<EndEpilogue;
+	ld   ra, 8(sp)
+	ld   s0, 0(sp)
+	addi sp, sp, 16
+	ret
+EndEpilogue
+
+my $i = 0;
+
+while ($i <= $functions) {
+	emit_empty_callee($i);
+	$i++;
+}
+
+emit_patch_callees();
+
+#####################################################
+
+sub should_patch($) {
+	my ($callee) = @_;
+	if ($callee == $calls) {
+		return 0;
+	}
+	if (($callee + 1) % $patch_every_n_calls == 0) {
+		return 1;
+	} else {
+		return 0;
+	}
+}
+
+#
+# Emit a call-site.
+#
+sub emit_call_site() {
+	my ($callee) = @_;
+	my $next = ($callee % $functions) + 1;
+	# print "\tfence.i\n";
+	print "\tjal CALLEE_$next\n";
+}
+
+#
+# Emit a patching call-site.
+#
+sub emit_patching_call_site() {
+	my ($callee) = @_;
+	# print "\tfence.i\n";
+	print "\tjal PATCHER\n";
+}
+
+#
+# Emit a function that patches the next (after we return) call.
+#
+sub emit_patch_callees() {
+	my $next = $functions + 1;
+	print "PATCHER:\n";
+	if ($patch_percentage == 100) {
+		print "\tla t0, PATCHER\n";
+		# print "\tauipc t0, %hi(PATCHER)\n";
+		# print "\taddi  t0, t0, %lo(PATCHER)\n";
+	} else {
+		print "\tla t0, CALLEE_0\n";
+		# print "\tauipc t0, %hi(CALLEE_0)\n";
+		# print "\taddi  t0, t0, %lo(CALLEE_0)\n";
+	}
+	print <<EndOfCalleeStub;
+	sub  t0, t0, ra /* calculate the offset */
+	/* place imm[10:1] in t2[30:21] */
+	srli t1, t0, 1
+	andi t1, t1, 0x3ff
+	slli t2, t1, 21
+	/* place imm[11] in t2[20] */
+	srli t1, t0, 11
+	andi t1, t1, 1
+	slli t1, t1, 20
+	or   t2, t2, t1
+	/* place imm[19:12] in t2[19:12] */
+	srli t1, t0, 12
+	andi t1, t1, 0xff
+	slli t1, t0, 12
+	or   t2, t2, t1
+	/* place imm[20] in t2[31] */
+	slli t1, t0, 20
+	srli t1, t1, 31
+	or   t2, t2, t1
+	addi t2, t2, 0xef /* jal ra opcode */
+	sd   t2, 0(ra)    /* patch it */
+	fence
+	fence.i
+test_end:
+	ret
+EndOfCalleeStub
+}
+
+sub emit_empty_callee() {
+	my ($callee) = @_;
+	my $next = ($callee % $functions) + 1;
+	print <<EndOfCalleeStub;
+CALLEE_$callee:
+	ret
+EndOfCalleeStub
+}
+
+# Local Variables:
+# tab-width: 8
+# indent-tabs-mode: t
+# End:
